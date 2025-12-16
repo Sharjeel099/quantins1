@@ -1,7 +1,6 @@
-# delta_paper_bot_final.py
 """
-Paper trading bot using Delta Exchange WebSocket candles (1m).
-NO REAL ORDERS. SAFE TO RUN.
+Delta Exchange Paper Trading Bot (1m candles)
+NO REAL ORDERS
 """
 
 import asyncio
@@ -16,32 +15,34 @@ import websockets
 WS_URL = "wss://socket.india.delta.exchange"
 SYMBOL = "ETHUSD"
 
-LONG_THRESH = 0.01     # 0.01%
-SHORT_THRESH = -0.01
+LONG_THRESH = 0.005     # 0.005%
+SHORT_THRESH = -0.005
+
+EXIT_DEADBAND = 0.005
 
 POSITION_SIZE = 1
 START_BALANCE = 100_000
 
-MAX_TRADES = 50
+MAX_TRADES = 100
 MAX_DRAWDOWN = -5_000
-
-EXIT_DEADBAND = 0.002  # avoid noise exits
 
 # =========================
 # STATE
 # =========================
 closes = deque(maxlen=10)
-signal_buf = deque(maxlen=2)
 
 position = "FLAT"
 entry_price = None
 balance = START_BALANCE
 trades = 0
-last_candle_ts = None
+last_ts = None
 
 # =========================
 # UTILS
 # =========================
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
 def compute_return(new, prev):
     return (new - prev) / prev if prev else 0.0
 
@@ -51,9 +52,6 @@ def signal_from_return(ret_pct):
     if ret_pct < SHORT_THRESH:
         return -1
     return 0
-
-def log(msg):
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 # =========================
 # PAPER EXECUTION
@@ -82,19 +80,15 @@ def exit_position(price):
         return
 
     balance += pnl
-    log(f"EXIT {position} @ {price} | PnL={pnl:.2f} | Balance={balance:.2f}")
+    log(f"EXIT {position} @ {price} | PnL={pnl:.2f} | Bal={balance:.2f}")
     position = "FLAT"
     entry_price = None
 
 # =========================
-# STATE MACHINE
+# STRATEGY
 # =========================
-def handle_signal(signal, price, ret_pct):
+def handle(signal, price, ret_pct):
     global position
-
-    # Require signal persistence (2 candles)
-    if len(signal_buf) < 2 or not all(s == signal for s in signal_buf):
-        return
 
     if position == "FLAT":
         if signal == 1:
@@ -120,18 +114,27 @@ def handle_signal(signal, price, ret_pct):
 # MAIN LOOP
 # =========================
 async def run():
-    global last_candle_ts
+    global last_ts
 
-    async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+    async with websockets.connect(
+        WS_URL,
+        ping_interval=20,
+        ping_timeout=10
+    ) as ws:
+
         await ws.send(json.dumps({
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "candlesticks_1m", "symbols": [SYMBOL]}
+                    {
+                        "name": "candlestick_1m",
+                        "symbols": [SYMBOL]
+                    }
                 ]
             }
         }))
-        log("Subscribed to candle data")
+
+        log("Subscribed to Delta 1m candle CLOSE")
 
         async for msg in ws:
             data = json.loads(msg)
@@ -141,33 +144,30 @@ async def run():
 
             candle = payload[-1]
 
-            # 🔐 Only completed candles
+            # Only act on closed candles
             if not candle.get("is_final", False):
                 continue
 
             ts = candle["start_timestamp"]
-            if ts == last_candle_ts:
+            if ts == last_ts:
                 continue
-            last_candle_ts = ts
+            last_ts = ts
 
             close = float(candle["close"])
 
             if closes:
-                r = compute_return(close, closes[-1])
-                ret_pct = r * 100
+                ret_pct = compute_return(close, closes[-1]) * 100
             else:
                 ret_pct = 0.0
 
             closes.append(close)
 
             signal = signal_from_return(ret_pct)
-            signal_buf.append(signal)
 
-            log(f"[CLOSE] Close={close} Ret%={ret_pct:.4f} Signal={signal}")
+            log(f"[CLOSE] {close} Ret%={ret_pct:.4f} Signal={signal}")
 
-            handle_signal(signal, close, ret_pct)
+            handle(signal, close, ret_pct)
 
-            # ---- Kill switches
             if trades >= MAX_TRADES:
                 log("MAX TRADES HIT — STOPPING")
                 break
