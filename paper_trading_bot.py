@@ -1,6 +1,6 @@
-# delta_paper_bot_fixed.py
+# delta_paper_bot_final.py
 """
-Paper trading bot using Delta Exchange WebSocket candles.
+Paper trading bot using Delta Exchange WebSocket candles (1m).
 NO REAL ORDERS. SAFE TO RUN.
 """
 
@@ -16,10 +16,7 @@ import websockets
 WS_URL = "wss://socket.india.delta.exchange"
 SYMBOL = "ETHUSD"
 
-WINDOW = 5
-
-# Realistic for 1-min ETH
-LONG_THRESH = 0.01     # 0.01 %
+LONG_THRESH = 0.01     # 0.01%
 SHORT_THRESH = -0.01
 
 POSITION_SIZE = 1
@@ -28,15 +25,13 @@ START_BALANCE = 100_000
 MAX_TRADES = 50
 MAX_DRAWDOWN = -5_000
 
-EXIT_DEADBAND = 0.002   # do not exit on tiny noise
+EXIT_DEADBAND = 0.002  # avoid noise exits
 
 # =========================
 # STATE
 # =========================
-closes = deque(maxlen=WINDOW + 1)
-returns = deque(maxlen=WINDOW)
-
-signal_buf = deque(maxlen=2)  # signal persistence
+closes = deque(maxlen=10)
+signal_buf = deque(maxlen=2)
 
 position = "FLAT"
 entry_price = None
@@ -97,7 +92,7 @@ def exit_position(price):
 def handle_signal(signal, price, ret_pct):
     global position
 
-    # require signal persistence (2 candles)
+    # Require signal persistence (2 candles)
     if len(signal_buf) < 2 or not all(s == signal for s in signal_buf):
         return
 
@@ -127,7 +122,7 @@ def handle_signal(signal, price, ret_pct):
 async def run():
     global last_candle_ts
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
         await ws.send(json.dumps({
             "type": "subscribe",
             "payload": {
@@ -136,7 +131,7 @@ async def run():
                 ]
             }
         }))
-        log("Subscribed to candles")
+        log("Subscribed to candle data")
 
         async for msg in ws:
             data = json.loads(msg)
@@ -145,17 +140,20 @@ async def run():
                 continue
 
             candle = payload[-1]
-            close = float(candle["close"])
-            ts = candle["start_timestamp"]
 
-            # ---- Candle gating
+            # 🔐 Only completed candles
+            if not candle.get("is_final", False):
+                continue
+
+            ts = candle["start_timestamp"]
             if ts == last_candle_ts:
                 continue
             last_candle_ts = ts
 
+            close = float(candle["close"])
+
             if closes:
                 r = compute_return(close, closes[-1])
-                returns.append(r)
                 ret_pct = r * 100
             else:
                 ret_pct = 0.0
@@ -165,7 +163,7 @@ async def run():
             signal = signal_from_return(ret_pct)
             signal_buf.append(signal)
 
-            log(f"Close={close} Ret%={ret_pct:.4f} Signal={signal}")
+            log(f"[CLOSE] Close={close} Ret%={ret_pct:.4f} Signal={signal}")
 
             handle_signal(signal, close, ret_pct)
 
