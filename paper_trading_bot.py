@@ -1,13 +1,7 @@
-# delta_paper_bot.py
+# delta_paper_bot_fixed.py
 """
 Paper trading bot using Delta Exchange WebSocket candles.
 NO REAL ORDERS. SAFE TO RUN.
-
-Requirements:
-  pip install websockets aiohttp
-
-Environment variables:
-  DELTA_WS_URL (optional)
 """
 
 import asyncio
@@ -21,14 +15,20 @@ import websockets
 # =========================
 WS_URL = "wss://socket.india.delta.exchange"
 SYMBOL = "ETHUSD"
+
 WINDOW = 5
-LONG_THRESH = 0.1
-SHORT_THRESH = -0.1
+
+# Realistic for 1-min ETH
+LONG_THRESH = 0.01     # 0.01 %
+SHORT_THRESH = -0.01
+
 POSITION_SIZE = 1
 START_BALANCE = 100_000
 
 MAX_TRADES = 50
-MAX_DRAWDOWN = -5_000  # stop if loss exceeds this
+MAX_DRAWDOWN = -5_000
+
+EXIT_DEADBAND = 0.002   # do not exit on tiny noise
 
 # =========================
 # STATE
@@ -36,7 +36,9 @@ MAX_DRAWDOWN = -5_000  # stop if loss exceeds this
 closes = deque(maxlen=WINDOW + 1)
 returns = deque(maxlen=WINDOW)
 
-position = "FLAT"   # FLAT / LONG / SHORT
+signal_buf = deque(maxlen=2)  # signal persistence
+
+position = "FLAT"
 entry_price = None
 balance = START_BALANCE
 trades = 0
@@ -46,10 +48,7 @@ last_candle_ts = None
 # UTILS
 # =========================
 def compute_return(new, prev):
-    return (new - prev) / prev if prev != 0 else 0.0
-
-def rolling_mean():
-    return sum(returns) / len(returns) if returns else 0.0
+    return (new - prev) / prev if prev else 0.0
 
 def signal_from_return(ret_pct):
     if ret_pct > LONG_THRESH:
@@ -59,7 +58,7 @@ def signal_from_return(ret_pct):
     return 0
 
 def log(msg):
-    print(time.strftime("%H:%M:%S"), msg)
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 # =========================
 # PAPER EXECUTION
@@ -95,8 +94,12 @@ def exit_position(price):
 # =========================
 # STATE MACHINE
 # =========================
-def handle_signal(signal, price):
+def handle_signal(signal, price, ret_pct):
     global position
+
+    # require signal persistence (2 candles)
+    if len(signal_buf) < 2 or not all(s == signal for s in signal_buf):
+        return
 
     if position == "FLAT":
         if signal == 1:
@@ -108,14 +111,14 @@ def handle_signal(signal, price):
         if signal == -1:
             exit_position(price)
             enter_short(price)
-        elif signal == 0:
+        elif signal == 0 and abs(ret_pct) < EXIT_DEADBAND:
             exit_position(price)
 
     elif position == "SHORT":
         if signal == 1:
             exit_position(price)
             enter_long(price)
-        elif signal == 0:
+        elif signal == 0 and abs(ret_pct) < EXIT_DEADBAND:
             exit_position(price)
 
 # =========================
@@ -125,15 +128,14 @@ async def run():
     global last_candle_ts
 
     async with websockets.connect(WS_URL) as ws:
-        sub = {
+        await ws.send(json.dumps({
             "type": "subscribe",
             "payload": {
                 "channels": [
                     {"name": "candlesticks_1m", "symbols": [SYMBOL]}
                 ]
             }
-        }
-        await ws.send(json.dumps(sub))
+        }))
         log("Subscribed to candles")
 
         async for msg in ws:
@@ -146,21 +148,26 @@ async def run():
             close = float(candle["close"])
             ts = candle["start_timestamp"]
 
-            # ---- Candle gating (prevents double fire)
+            # ---- Candle gating
             if ts == last_candle_ts:
                 continue
             last_candle_ts = ts
 
             if closes:
-                returns.append(compute_return(close, closes[-1]))
+                r = compute_return(close, closes[-1])
+                returns.append(r)
+                ret_pct = r * 100
+            else:
+                ret_pct = 0.0
+
             closes.append(close)
 
-            ret_pct = rolling_mean() * 100
             signal = signal_from_return(ret_pct)
+            signal_buf.append(signal)
 
             log(f"Close={close} Ret%={ret_pct:.4f} Signal={signal}")
 
-            handle_signal(signal, close)
+            handle_signal(signal, close, ret_pct)
 
             # ---- Kill switches
             if trades >= MAX_TRADES:
